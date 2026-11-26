@@ -14,3 +14,5 @@ __pycache__/
 
 # Power BI temporary files
 *.tmp
+
+.env

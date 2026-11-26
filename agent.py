@@ -1,36 +1,97 @@
-from tools import normalize_assets, validate_news
+
+import os
 import json
-import requests
+
+from dotenv import load_dotenv
+from google import genai
+
+from tools import normalize_assets, validate_news
 
 
-# Ollama configuration
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "qwen3:4b"
+# Load environment variables from .env
+load_dotenv()
+
+MODEL_NAME = "gemini-3.5-flash-lite"
+
+
+# JSON Schema for structured output
+NEWS_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "category": {
+            "type": "STRING",
+            "enum": [
+                "Monetary Policy",
+                "Macroeconomics",
+                "Corporate",
+                "Geopolitics",
+                "Crypto"
+            ]
+        },
+        "sentiment": {
+            "type": "STRING",
+            "enum": ["Positive", "Neutral", "Negative"]
+        },
+        "assets": {
+            "type": "ARRAY",
+            "items": {
+                "type": "STRING",
+                "enum": [
+                    "BTC",
+                    "ETH",
+                    "Gold",
+                    "S&P 500",
+                    "NASDAQ",
+                    "USD",
+                    "US Treasury",
+                    "Nvidia"
+                ]
+            }
+        },
+        "risk_level": {
+            "type": "STRING",
+            "enum": ["Low", "Medium", "High"]
+        },
+        "summary": {
+            "type": "STRING"
+        },
+        "impact_rationale": {
+            "type": "STRING"
+        }
+    },
+    "required": [
+        "category",
+        "sentiment",
+        "assets",
+        "risk_level",
+        "summary",
+        "impact_rationale"
+    ],
+    "additionalProperties": False
+}
 
 
 def analyze_news(news_text):
     """
-    Analyze financial news using a local LLM.
+    Analyze financial news using the Gemini API.
     Return the analysis as a Python dictionary.
     """
 
-    prompt = f"""
-You are a financial news analyst.
+    api_key = os.getenv("GEMINI_API_KEY")
+
+    if not api_key:
+        print("Error: GEMINI_API_KEY not found in .env file.")
+        return None
+
+    try:
+        client = genai.Client(api_key=api_key)
+
+        prompt = f"""
+You are a professional financial news analyst.
 
 Analyze the following financial news:
 
 {news_text}
-
-Return ONLY a valid JSON object with these fields:
-
-{{
-    "category": ["Monetary Policy", "Macroeconomics", "Corporate", "Geopolitics", "Crypto"],
-    "sentiment": ["Positive", "Neutral", "Negative"],
-    "assets": ["BTC", "ETH", "Gold", "S&P 500", "NASDAQ", "USD", "US Treasury", "Nvidia"],
-    "risk_level": ["Low", "Medium", "High"],
-    "summary": "A concise summary of the news",
-    "impact_rationale": "Explain the potential impact on affected assets"
-}}
 
 Category Classification Rules:
 - Monetary Policy: News about central bank policies, interest rate decisions, monetary policy changes, and central bank actions.
@@ -40,7 +101,6 @@ Category Classification Rules:
 - Crypto: News about cryptocurrencies, blockchain, digital assets, and cryptocurrency markets.
 - Select the single most relevant category based on the main focus of the article.
 - If an article covers multiple topics, classify it according to its primary focus.
-- Always use one of the exact category names provided.
 
 Sentiment Classification Rules:
 - Positive: The news indicates favorable developments or potentially beneficial implications for the affected assets or financial markets.
@@ -48,7 +108,6 @@ Sentiment Classification Rules:
 - Neutral: The news is primarily factual, contains balanced or mixed implications, or has no clearly identifiable positive or negative financial impact.
 - Determine sentiment based on the overall financial implications of the news, not isolated positive or negative words.
 - Evaluate sentiment from the perspective of the affected assets or financial markets.
-- Do not automatically classify good company performance as Positive if the overall financial implications are unfavorable, or vice versa.
 
 Risk Level Classification Rules:
 - Low: The news has limited potential financial impact, involves routine developments, or is unlikely to create significant market disruption.
@@ -58,93 +117,98 @@ Risk Level Classification Rules:
 - Do not assign High risk unless there is a reasonable basis for expecting significant or widespread financial consequences.
 
 Asset Classification Rules:
-- Use only standardized asset names from the supported asset list.
+- Use only the supported standardized asset names.
 - Do not invent alternative asset names.
 - Distinguish between stock exchanges and market indices.
-- If an asset cannot be confidently mapped to the supported list, omit it.
+- If an asset cannot be confidently mapped to a supported asset, omit it.
+- Return an empty list if no supported assets are affected.
 
 General Rules:
-- Return valid JSON only.
-- Do not use Markdown code fences.
 - Do not invent information that is not in the article.
-- If no asset is explicitly identifiable, return an empty list.
 - Distinguish between general news sentiment and potential asset impact.
 - Do not claim that news caused an asset price movement unless the article explicitly establishes this.
 - Separate reported facts from potential implications.
-- Apply sentiment and risk classification criteria consistently across all news articles.
-- Sentiment and risk level must be evaluated independently. Positive news can have High risk, and Negative news can have Low risk.
+- Apply sentiment and risk classification criteria consistently.
+- Sentiment and risk level must be evaluated independently.
+- Positive news can have High risk, and Negative news can have Low risk.
+- Keep the summary concise and factual.
+- Explain the potential financial implications in impact_rationale.
 """
 
-    payload = {
-        "model": MODEL_NAME,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-        "options":{
-            "temperature": 0
-        }
-    }
-
-    try:
-        response = requests.post(
-            OLLAMA_URL,
-            json=payload,
-            timeout=180
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config={
+                "temperature": 0,
+                "response_mime_type": "application/json",
+                "response_json_schema": NEWS_SCHEMA
+            }
         )
 
-        response.raise_for_status()
-
-        result = response.json()
+        if not response.text:
+            print("Error: Gemini returned an empty response.")
+            return None
 
         # Convert JSON string into a Python dictionary
-        analysis = json.loads(result["response"])
+        analysis = json.loads(response.text)
 
         # Normalize asset names
         analysis["assets"] = normalize_assets(analysis["assets"])
 
         # Validate the analysis
         is_valid, error = validate_news(analysis)
+
         if not is_valid:
             print(f"Invalid news analysis: {error}")
             return None
 
         return analysis
 
-    except requests.exceptions.RequestException as e:
-        print(f"Error connecting to Ollama: {e}")
+    except json.JSONDecodeError as e:
+        print(f"Error processing Gemini JSON response: {e}")
         return None
 
-    except (json.JSONDecodeError, KeyError) as e:
-        print(f"Error processing LLM response: {e}")
+    except Exception as e:
+        print(f"Error connecting to Gemini API: {e}")
         return None
 
 
 if __name__ == "__main__":
 
     news = """
-SYDNEY, Nov 26 (Reuters) - Asian shares eked out a rare rally on Thursday after ​Wall Street fought back from deep lows, though concerns over the circular financing of AI and a new ‌round of US tariffs made for a muted mood in a holiday-thinned session.
-Tech giant Nvidia (NVDA.O), opens new tab was again at the centre of the unease after S&P put its credit rating on watch for a possible downgrade citing weaknesses in the chipmaker's management and board oversight.
-Make sense of global markets with the Trading Day newsletter. Sign up here.
-Nvidia stock ended down 3.9% at $149.30 on Wednesday, $2.3 trillion short ​of its October peak of $243.37.
-Wall Street did recoup most of its initial losses overnight as money moved into other, more ​defensive, sectors. S&P 500 futures added 0.5% early on Thursday, while Nasdaq futures firmed 0.4%.
-Japan's Nikkei (.N225), opens new tab ⁠gained 1.6% and South Korea's main index (.KS11), opens new tab rose 1.9%. Japan is down 8% for the month, while South Korea has shed ​16% and Taiwan 15%.
-Asia-Pacific shares outside Japan (.MISX00000PUS), opens new tab edged up 0.6%, but were still off 9% for November so far.
-Bond investors are wondering ​if the broad losses in stocks coupled with doubts on the durability of AI-driven business investment might temper the hawkishness of central banks.
-It was notable that Treasury yields hit multi-week lows on Wednesday even as US economic growth for the third quarter was revised up sharply to 4.3%, while the Federal ​Reserve's favoured measure of core inflation hit an uncomfortably high 3.3%.
-While futures still imply a 98% chance the Fed will raise ​rates by 25 basis points in December, speculation of a half-point increase has faded.
-Yields on 10-year paper were off at 4.848% , having touched an 11-week ‌trough overnight.
-TARIFFS ⁠ADD TO INFLATION RISK
-Still, the outlook for inflation was not helped by White House proposals for new tariffs on 14 major trading partners including China, Japan and the European Union, though crucially the new duties will not stack on top of those imposed in July.
-"The latest US tariff announcement is not as alarming as it looks, and the increase in the effective tariff rate looks set to ​be a touch lower than ​we've been assuming," said Stephen ⁠Brown, chief North America economist at Capital Economics.
-"The additional tariff burden is likely to be small, but will still provide a marginal boost to prices and keep core goods inflation firm into next ​year."
-In currency markets, the dollar's recent strength was tempered somewhat by the drop in Treasury ​yields, with the ⁠dollar index easing a touch to 103.71 .
-The safe-haven Swiss franc was a major gainer as the dollar slipped to 0.8311 francs , while the euro inched up to $1.0973 from its recent low of $1.0881.
-The dollar held steady on the yen at 159.14 , with the risk of intervention keeping ⁠160.00 resistance ​intact.
-In commodity markets, oil prices held firm after Yemen's Houthis said they had ​attacked Saudi Arabia's largest oil refinery, raising concerns about unexpected Middle East supply disruptions.
-Brent futures rose 0.2% to $94.81 a barrel, while US crude futures added 0.6% to $84.24 ​a barrel.
-Non-interest-bearing gold eased 0.4% to $3,566 an ounce , having fallen almost 8% so far this month.
-Reporting by Wayne Cole; Editing by Kate Mayberry
+Dollar steady as sliding yields temper safe-haven bid
 
+Thu 26/11/2026 - 02:43
+SHANGHAI, Nov 26 (Reuters) - The dollar was steady in Asian trading on Thursday after dropping to a one-week low overnight, as falling Treasury yields and fragile risk sentiment offset the greenback's usual safe-haven appeal ahead of the Thanksgiving holiday.
+
+The US dollar index slipped overnight as US equities pared losses and showed little reaction to strong economic data, leaving it well off a 19-month high struck on Monday when Jensen Huang's return as Nvidia chief executive reignited the artificial intelligence trade, while also bolstering confidence that robust US economic growth could warrant further rate hikes.
+
+"The risk-reward of chasing further USD gains looks less attractive, but hawkish Fed risks should keep the dollar supported," said Sim Moh Siong, an FX strategist at OCBC.
+
+He said that the dollar's relationship with equities could remain choppy, caught between safe-haven demand and concerns that a deeper AI slowdown could weigh on US growth.
+
+The yen edged 0.1% higher against the dollar, trading around 159.06 in early Asian trade. The euro was little changed at $1.097 as the market's focus turned to the accounts of the October European Central Bank meeting, scrutinised for hints on the rate outlook.
+
+The US dollar index, which measures the greenback's strength against a basket of six currencies, was flat at 103.7.
+
+Hotter-than-expected US core personal consumption expenditures inflation in October, a sharp upward revision to third-quarter gross domestic product and a Federal Reserve survey showing continued economic growth and sticky inflation cemented expectations the Fed will raise rates by 25 basis points (bps) in December and again in early 2027.
+
+"There may also be a long weekend effect where being long bonds might not be a bad option," ING analysts said in a note. "But still, it's been a week so far in which Treasuries have ignored valid reasons for yields to rise."
+
+Treasury yields fell across the curve, led by the long end. The 10-year yield dropped as much as 10 bps to a 2-1/2-month low of 4.8%.
+
+Falling yields handed some relief to beaten-down currencies. The Aussie dollar recovered above 0.66 and was last at 0.6635, bouncing off an earlier low of 0.6557 that marked its weakest level in almost a year.
+
+Adding to the sour tone, the Trump administration proposed new tariffs on goods from 14 major trading partners on Wednesday. The trade levies are meant to combat what Washington called structural excess industrial capacity, with the highest rates to hit China, which the US blames most for flooding world markets with cheap exports.
+
+With most US markets shut on Thursday for Thanksgiving, Asia trades without fresh US price action, leaving thin liquidity for the session, market participants said.
+
+The Swiss franc edged lower on Thursday, having firmed 0.5% overnight on safe-haven demand, while the Canadian dollar held on to a two-week high as oil prices rose.
+
+Brent crude futures settled 3.5% higher at $94.61 a barrel, after Yemen's Houthis said they had attacked ​Saudi Arabia's largest oil refinery.
+
+
+(Reporting by Shanghai Newsroom; Editing by Thomas Derpinghaus)
 """
 
     analysis = analyze_news(news)
